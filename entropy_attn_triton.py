@@ -180,6 +180,7 @@ def _attn_fwd(sm_scale, M, E,  #
     off_hz = tl.program_id(1)
     off_z = off_hz // H
     off_h = off_hz % H
+    ln2 = 0.69314718056
 
     y_dim = Z * H * N_CTX
     desc_q = _maybe_make_tensor_desc(desc_q, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
@@ -229,7 +230,7 @@ def _attn_fwd(sm_scale, M, E,  #
                                         2, offs_m, offs_n, N_CTX,  #
                                         warp_specialize, IS_HOPPER)
     # epilogue
-    e_i = tl.math.log(l_i) + m_i - (e_i / l_i)
+    e_i = tl.math.log(l_i) + m_i * ln2  - (e_i / l_i) * ln2
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
