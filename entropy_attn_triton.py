@@ -498,74 +498,101 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=False):
+    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=False, decode=False):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
-        o = torch.empty_like(q)
-        stage = 3 if causal else 1
+        # Decode means a small number of queries (often 1) attending over a longer KV length.
+        if decode:
+            assert k.shape[2] >= q.shape[2], "Decode expects KV length >= query length"
+        else:
+            assert k.shape[2] == q.shape[2], "Prefill expects matching sequence lengths"
         extra_kern_args = {}
         # Tuning for AMD target
         if is_hip():
             waves_per_eu = 3 if HEAD_DIM_K <= 64 else 2
             extra_kern_args = {"waves_per_eu": waves_per_eu, "allow_flush_denorm": True}
 
+        # Allocate outputs and entropy/m log buffers sized to the number of queries.
         M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
         E = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
-        # Use device_descriptor for Hopper + warpspec.
-        if supports_host_descriptor() and not (is_hopper() and warp_specialize):
-            # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
-            y_dim = q.shape[0] * q.shape[1] * q.shape[2]
-
-            dummy_block = [1, 1]
-            desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-            if q.dtype == torch.float8_e5m2:
-                desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1],
-                                          block_shape=dummy_block)
-            else:
-                desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
-                                          block_shape=dummy_block)
-            desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-            desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1], block_shape=dummy_block)
-        else:
-            desc_q = q
-            desc_v = v
-            desc_k = k
-            desc_o = o
 
         def alloc_fn(size: int, align: int, _):
             return torch.empty(size, dtype=torch.int8, device="cuda")
 
         triton.set_allocator(alloc_fn)
 
-        def grid(META):
-            return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+        if decode:
+            # Fallback to Torch for decode to avoid tiny matrix products in tl.dot.
+            base_pos = k.shape[2] - q.shape[2]
+            # scores: [B, H, N_Q, KV_N_CTX]
+            attn_scores = torch.matmul(q.to(torch.float32), k.transpose(-2, -1).to(torch.float32)) * sm_scale
+            if causal:
+                q_idx = torch.arange(q.shape[2], device=q.device).view(1, 1, -1, 1)
+                k_idx = torch.arange(k.shape[2], device=q.device).view(1, 1, 1, -1)
+                causal_mask = (q_idx + base_pos) >= k_idx
+                attn_scores = attn_scores.masked_fill(~causal_mask, float("-inf"))
+            attn = torch.softmax(attn_scores, dim=-1)
+            o = torch.matmul(attn, v.to(torch.float32)).to(q.dtype)
+            entropy = -(attn * torch.log(attn + 1e-9)).sum(dim=-1).to(torch.float32)
+            E.copy_(entropy)
+            M.zero_()  # m is unused in the torch path but kept for API parity
+        else:
+            o = torch.empty_like(q)
+            stage = 3 if causal else 1
+            # Use device_descriptor for Hopper + warpspec.
+            if supports_host_descriptor() and not (is_hopper() and warp_specialize):
+                # Note that on Hopper we cannot perform a FP8 dot with a non-transposed second tensor
+                y_dim = q.shape[0] * q.shape[1] * q.shape[2]
 
-        ctx.grid = grid
-        if is_blackwell() and warp_specialize:
-            if HEAD_DIM_K == 128 and q.dtype == torch.float16:
-                extra_kern_args["maxnreg"] = 168
+                dummy_block = [1, 1]
+                desc_q = TensorDescriptor(q, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
+                                          block_shape=dummy_block)
+                if q.dtype == torch.float8_e5m2:
+                    desc_v = TensorDescriptor(v, shape=[HEAD_DIM_K, y_dim], strides=[q.shape[2], 1],
+                                              block_shape=dummy_block)
+                else:
+                    desc_v = TensorDescriptor(v, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
+                                              block_shape=dummy_block)
+                desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
+                                          block_shape=dummy_block)
+                desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
+                                          block_shape=dummy_block)
             else:
-                extra_kern_args["maxnreg"] = 80
-        _attn_fwd[grid](
-            sm_scale, M, E,  #
-            q.shape[0], q.shape[1],  #
-            desc_q, desc_k, desc_v, desc_o,  #
-            N_CTX=q.shape[2],  #
-            HEAD_DIM=HEAD_DIM_K,  #
-            FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
-            STAGE=stage,  #
-            warp_specialize=warp_specialize,  #
-            IS_HOPPER=is_hopper(),  #
-            **extra_kern_args)
+                desc_q = q
+                desc_v = v
+                desc_k = k
+                desc_o = o
+
+            def grid(META):
+                return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+
+            ctx.grid = grid
+            if is_blackwell() and warp_specialize:
+                if HEAD_DIM_K == 128 and q.dtype == torch.float16:
+                    extra_kern_args["maxnreg"] = 168
+                else:
+                    extra_kern_args["maxnreg"] = 80
+            _attn_fwd[grid](
+                sm_scale, M, E,  #
+                q.shape[0], q.shape[1],  #
+                desc_q, desc_k, desc_v, desc_o,  #
+                N_CTX=q.shape[2],  #
+                HEAD_DIM=HEAD_DIM_K,  #
+                FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+                STAGE=stage,  #
+                warp_specialize=warp_specialize,  #
+                IS_HOPPER=is_hopper(),  #
+                **extra_kern_args)
 
         ctx.save_for_backward(q, k, v, o, M, E)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
+        ctx.decode = decode
         return o, E
 
     @staticmethod
