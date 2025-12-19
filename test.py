@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from entropy_attn_triton import attention
 
-def test_prefill(Z=1, H=8, N_CTX=512, HEAD_DIM=128):
+def test_prefill(Z=1, H=8, N_CTX=512, HEAD_DIM=128, temp=1.0):
     device = "cuda:0"
     dtype = torch.float16
 
@@ -13,7 +13,7 @@ def test_prefill(Z=1, H=8, N_CTX=512, HEAD_DIM=128):
 
     qk = torch.einsum("bhqd,bhkd->bhqk", q * scale, k)
     mask = torch.triu(torch.ones(N_CTX, N_CTX, device=device, dtype=torch.bool), 1)
-    qk = qk - (mask * 1e8).half()
+    qk = (qk / temp) - (mask * 1e8).half()
     A = qk.softmax(dim=-1)
 
     logA = torch.log_softmax(qk, dim=-1).float()
@@ -21,7 +21,7 @@ def test_prefill(Z=1, H=8, N_CTX=512, HEAD_DIM=128):
 
     out = torch.einsum("bhqk,bhkd->bhqd", A, v)
 
-    triton_out, triton_entropy = attention(q, k, v, True, scale)
+    triton_out, triton_entropy = attention(q, k, v, True, scale, temp)
 
     diff = (out - triton_out).abs()
     print(f"{diff.amax()=}")
@@ -32,7 +32,8 @@ def test_prefill(Z=1, H=8, N_CTX=512, HEAD_DIM=128):
     entropy_diff = (entropy - triton_entropy).abs()
     print(f"{entropy_diff.amax()=} {entropy_diff.mean()=}")
 
-def test_decode(Z=1, H=8, N_CTX=512, HEAD_DIM=128):
+
+def test_decode(Z=1, H=8, N_CTX=512, HEAD_DIM=128, temp=1.0):
     device = "cuda:0"
     dtype = torch.float16
 
@@ -41,7 +42,7 @@ def test_decode(Z=1, H=8, N_CTX=512, HEAD_DIM=128):
     v = 0.5 * torch.randn(Z, H, N_CTX, HEAD_DIM, device=device, dtype=dtype)
     scale = 1 / np.sqrt(HEAD_DIM)
 
-    qk = torch.einsum("bhqd,bhkd->bhqk", q * scale, k)
+    qk = torch.einsum("bhqd,bhkd->bhqk", q * scale, k) / temp
     A = qk.softmax(dim=-1)
 
     logA = torch.log_softmax(qk, dim=-1).float()
@@ -49,7 +50,7 @@ def test_decode(Z=1, H=8, N_CTX=512, HEAD_DIM=128):
 
     out = torch.einsum("bhqk,bhkd->bhqd", A, v)
 
-    triton_out, triton_entropy = attention(q, k, v, True, scale)
+    triton_out, triton_entropy = attention(q, k, v, True, scale, temp)
 
     diff = (out - triton_out).abs()
     print(f"{diff.amax()=}")
@@ -61,5 +62,8 @@ def test_decode(Z=1, H=8, N_CTX=512, HEAD_DIM=128):
     print(f"{entropy_diff.amax()=} {entropy_diff.mean()=}")
 
 if __name__ == "__main__":
-    test_prefill()
-    test_decode()
+    for i in range(10):
+        temp = torch.rand(1).item()
+        print(f"\ntesting temperature: {temp}\n")
+        test_prefill(temp=temp)
+        test_decode(temp=temp)
