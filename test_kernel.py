@@ -1,10 +1,9 @@
 import torch
 import numpy as np
-from entropy_attn_triton import attention
+from models.entropy_attn_triton import attention
 
-def test_prefill(Z=1, H=8, N_CTX=512, HEAD_DIM=128, temp=None):
+def test_prefill(Z=1, H=8, N_CTX=512, HEAD_DIM=128, temp=None, dtype=torch.float16):
     device = "cuda:0"
-    dtype = torch.float16
 
     if temp is None:
         temp = torch.ones(Z, H, N_CTX, device=device, dtype=dtype)
@@ -16,7 +15,7 @@ def test_prefill(Z=1, H=8, N_CTX=512, HEAD_DIM=128, temp=None):
 
     qk = torch.einsum("bhqd,bhkd->bhqk", q * scale, k)
     mask = torch.triu(torch.ones(N_CTX, N_CTX, device=device, dtype=torch.bool), 1)
-    qk = (qk / temp.unsqueeze(-1)) - (mask * 1e8).half()
+    qk = (qk / temp.unsqueeze(-1)) - (mask * 1e8).to(dtype)
     A = qk.softmax(dim=-1)
 
     logA = torch.log_softmax(qk, dim=-1).float()
@@ -27,13 +26,15 @@ def test_prefill(Z=1, H=8, N_CTX=512, HEAD_DIM=128, temp=None):
     triton_out, triton_entropy = attention(q, k, v, True, scale, temp)
 
     diff = (out - triton_out).abs()
+    ent_diff = (entropy - triton_entropy).abs()
+
+    print(f"attn out diffmax: {diff.amax()=} ent diffmax: {ent_diff.amax()=}")
     torch.testing.assert_close(out, triton_out, atol=1e-2, rtol=0)
     torch.testing.assert_close(entropy, triton_entropy, atol=1e-2, rtol=0)
 
 
-def test_decode(Z=1, H=8, N_CTX=512, HEAD_DIM=128, temp=None):
+def test_decode(Z=1, H=8, N_CTX=512, HEAD_DIM=128, temp=None, dtype=torch.float16):
     device = "cuda:0"
-    dtype = torch.float16
 
     if temp is None:
         temp = torch.ones(Z, H, 1, device=device, dtype=dtype)
@@ -62,7 +63,7 @@ if __name__ == "__main__":
         dtype = torch.float16
         Z, H, N_CTX = 4, 8, 512
         temp = torch.rand(Z, H, N_CTX, device=device, dtype=dtype).clamp(min=0.1)
-        test_prefill(Z=Z, H=H, N_CTX=N_CTX, temp=temp)
-        test_decode(Z=Z, H=H, N_CTX=N_CTX, temp=temp[:, :, :1])
+        test_prefill(Z=Z, H=H, N_CTX=N_CTX, temp=temp, dtype=dtype)
+        test_decode(Z=Z, H=H, N_CTX=N_CTX, temp=temp[:, :, :1], dtype=dtype)
 
         print(f"{i} entropy random test ok!")

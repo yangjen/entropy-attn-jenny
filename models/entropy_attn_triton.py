@@ -105,7 +105,7 @@ def _host_descriptor_pre_hook(nargs):
     if not isinstance(nargs["desc_q"], TensorDescriptor):
         return
     nargs["desc_q"].block_shape = [BLOCK_M, HEAD_DIM]
-    if nargs["FP8_OUTPUT"]:
+    if nargs["DTYPE"] == 2: # FP8_OUTPUT
         nargs["desc_v"].block_shape = [HEAD_DIM, BLOCK_N]
     else:
         nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
@@ -162,7 +162,7 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
-@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
+@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "DTYPE", "warp_specialize"],
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M, E,  #
@@ -170,12 +170,21 @@ def _attn_fwd(sm_scale, M, E,  #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
-              FP8_OUTPUT: tl.constexpr,  #
+              DTYPE: tl.constexpr,
               STAGE: tl.constexpr,  #
               warp_specialize: tl.constexpr,  #
               IS_HOPPER: tl.constexpr,  #
               ):
-    dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
+
+    FP8_OUTPUT = False
+    if DTYPE == 0:
+        dtype = tl.bfloat16
+    elif DTYPE == 1:
+        dtype = tl.float16
+    elif DTYPE == 2:
+        dtype = tl.float8e5
+        FP8_OUTPUT = True
+
     tl.static_assert(BLOCK_N <= HEAD_DIM)
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -197,12 +206,13 @@ def _attn_fwd(sm_scale, M, E,  #
     desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_M, HEAD_DIM])
 
-    offset_temp = off_z * (N_CTX * H) + off_h * N_CTX + (start_m * BLOCK_M + tl.arange(0, BLOCK_M))
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
     qo_offset_y = offset_y + start_m * BLOCK_M
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
+    offset_temp = off_z * (N_CTX * H) + off_h * N_CTX + offs_m
+
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     e_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -210,7 +220,7 @@ def _attn_fwd(sm_scale, M, E,  #
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     # load scales
     qk_scale = sm_scale
-    t = tl.load(TEMP + offset_temp)
+    t = tl.load(TEMP + offset_temp, mask=offs_m < N_CTX, other=1.0)
     qk_scale *= 1.44269504 * (1 / t) # 1.44.. ~ 1/log(2) --> because 2^(x / ln2) == e^x
     # load q: it will stay in SRAM throughout
     q = desc_q.load([qo_offset_y, 0])
@@ -239,7 +249,7 @@ def _attn_fwd(sm_scale, M, E,  #
     m_ptrs = M + off_hz * N_CTX + offs_m
     e_ptrs = E + off_hz * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
-    tl.store(e_ptrs, e_i)
+    tl.store(e_ptrs, e_i, mask=offs_m < N_CTX)
     desc_o.store([qo_offset_y, 0], acc.to(dtype))
 
 
@@ -508,6 +518,9 @@ class _attention(torch.autograd.Function):
 
         assert len(temp.size()) == 3, f"temperature vector must be Z, H, N_CTX"
 
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
         temp = temp.contiguous()
 
         # shape constraints
@@ -583,17 +596,19 @@ class _attention(torch.autograd.Function):
 
             ctx.grid = grid
             if is_blackwell() and warp_specialize:
-                if HEAD_DIM_K == 128 and q.dtype == torch.float16:
+                if HEAD_DIM_K == 128 and q.dtype in [torch.float16, torch.bfloat16]:
                     extra_kern_args["maxnreg"] = 168
                 else:
                     extra_kern_args["maxnreg"] = 80
+
+            DTYPE = {torch.bfloat16: 0, torch.float16: 1, torch.float8_e5m2: 2}[q.dtype]
             _attn_fwd[grid](
                 sm_scale, M, E,  #
                 q.shape[0], q.shape[1],  #
                 desc_q, desc_k, desc_v, desc_o, temp,  #
                 N_CTX=q.shape[2],  #
                 HEAD_DIM=HEAD_DIM_K,  #
-                FP8_OUTPUT=q.dtype == torch.float8_e5m2,  #
+                DTYPE=DTYPE,
                 STAGE=stage,  #
                 warp_specialize=warp_specialize,  #
                 IS_HOPPER=is_hopper(),  #
