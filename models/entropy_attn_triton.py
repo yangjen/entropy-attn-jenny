@@ -110,7 +110,6 @@ def _host_descriptor_pre_hook(nargs):
     else:
         nargs["desc_v"].block_shape = [BLOCK_N, HEAD_DIM]
     nargs["desc_k"].block_shape = [BLOCK_N, HEAD_DIM]
-    nargs["desc_o"].block_shape = [BLOCK_M, HEAD_DIM]
 
 
 if is_hip():
@@ -166,7 +165,7 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
                  prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M, E,  #
-              Z, H, desc_q, desc_k, desc_v, desc_o, TEMP, N_CTX,  #
+              Z, H, desc_q, desc_k, desc_v, O, TEMP, N_CTX,  #
               HEAD_DIM: tl.constexpr,  #
               BLOCK_M: tl.constexpr,  #
               BLOCK_N: tl.constexpr,  #
@@ -203,8 +202,6 @@ def _attn_fwd(sm_scale, M, E,  #
                                          block_shape=[BLOCK_N, HEAD_DIM])
     desc_k = _maybe_make_tensor_desc(desc_k, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
                                      block_shape=[BLOCK_N, HEAD_DIM])
-    desc_o = _maybe_make_tensor_desc(desc_o, shape=[y_dim, HEAD_DIM], strides=[HEAD_DIM, 1],
-                                     block_shape=[BLOCK_M, HEAD_DIM])
 
     offset_y = off_z * (N_CTX * H) + off_h * N_CTX
     qo_offset_y = offset_y + start_m * BLOCK_M
@@ -212,6 +209,11 @@ def _attn_fwd(sm_scale, M, E,  #
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offset_temp = off_z * (N_CTX * H) + off_h * N_CTX + offs_m
+
+    o_off = (HEAD_DIM * H * N_CTX * off_z) \
+            + (HEAD_DIM * N_CTX * off_h) \
+            + (HEAD_DIM * offs_m)[:, None] \
+            + tl.arange(0, HEAD_DIM)[None, :]
 
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -248,9 +250,10 @@ def _attn_fwd(sm_scale, M, E,  #
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
     e_ptrs = E + off_hz * N_CTX + offs_m
-    tl.store(m_ptrs, m_i)
+    tl.store(m_ptrs, m_i, mask=offs_m < N_CTX)
     tl.store(e_ptrs, e_i, mask=offs_m < N_CTX)
-    desc_o.store([qo_offset_y, 0], acc.to(dtype))
+    tl.store(O + o_off, acc.to(dtype), mask=offs_m[:, None] < N_CTX)
+    # O.store([qo_offset_y, 0], acc.to(dtype))
 
 
 @triton.jit
@@ -583,13 +586,10 @@ class _attention(torch.autograd.Function):
                                               block_shape=dummy_block)
                 desc_k = TensorDescriptor(k, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
                                           block_shape=dummy_block)
-                desc_o = TensorDescriptor(o, shape=[y_dim, HEAD_DIM_K], strides=[HEAD_DIM_K, 1],
-                                          block_shape=dummy_block)
             else:
                 desc_q = q
                 desc_v = v
                 desc_k = k
-                desc_o = o
 
             def grid(META):
                 return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
@@ -605,7 +605,7 @@ class _attention(torch.autograd.Function):
             _attn_fwd[grid](
                 sm_scale, M, E,  #
                 q.shape[0], q.shape[1],  #
-                desc_q, desc_k, desc_v, desc_o, temp,  #
+                desc_q, desc_k, desc_v, o, temp,  #
                 N_CTX=q.shape[2],  #
                 HEAD_DIM=HEAD_DIM_K,  #
                 DTYPE=DTYPE,
