@@ -23,11 +23,11 @@ def _register_entropy_attn():
     print("[VERIFY] Registered entropy_attn attention impl")
     return wrapped
 
-_STR2DTYPE = {
-    "bf16": torch.bfloat16,
-    "fp16": torch.float16,
-    "fp32": torch.float32,
-}
+# _STR2DTYPE = {
+#     "bf16": torch.bfloat16,
+#     "fp16": torch.float16,
+#     "fp32": torch.float32,
+# }
 
 @dataclass
 class LlamaRunner:
@@ -56,7 +56,7 @@ class LlamaRunner:
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             config=config,
-            torch_dtype=self.dtype,   # IMPORTANT: use torch_dtype
+            torch_dtype=self.dtype,   # just dtype?
             device_map=None,
         ).to(self.device)
 

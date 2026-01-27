@@ -2,7 +2,7 @@ import torch
 from typing import Optional
 from models.entropy_attn_triton import attention as entropy_attention
 from transformers.utils import logging
-
+from models.entropy_scaling import EntropyTempController
 
 logger = logging.get_logger(__name__)
 
@@ -55,20 +55,70 @@ def entropy_attention_forward(
 
     Z, H, N_CTX, D = query.size()
 
+    # if hasattr(module, "past_entropy"):
+    #     # calculate the temperature somehow based on the past entropy
+    #     temp = torch.ones(Z, H, N_CTX, device=query.device, dtype=query.dtype)
+    # else:
+    #     temp = torch.ones(Z, H, N_CTX, device=query.device, dtype=query.dtype)
+    """
+    update temp using last token entropy, keep per-head state
+    Maintain a per-layer, per-head scalar temperature state (e.g., [Z, H, 1])
+
+    """
     if hasattr(module, "past_entropy"):
-        # calculate the temperature somehow based on the past entropy
-        temp = torch.ones(Z, H, N_CTX, device=query.device, dtype=query.dtype)
+        # entropy-conditioned temperature (controller already exists)
+        controller = module._entropy_temp_controller
     else:
-        temp = torch.ones(Z, H, N_CTX, device=query.device, dtype=query.dtype)
+        # first time this layer sees entropy → initialize controller
+        controller = EntropyTempController(
+            temp_init=1.0,
+            temp_min=0.6,
+            temp_max=1.2,
+            ema_beta=0.9,
+            kp=0.4,
+            max_step=0.05,
+        )
+        module._entropy_temp_controller = controller
+
+    # ensure controller state is initialized
+    if controller.temp is None:
+        controller._init_state(
+            (Z, H, 1),
+            query.device,
+        )
+
+    # expand temp to match attention shape
+    temp = controller.temp.expand(Z, H, N_CTX)
+
 
     attn_output, attn_entropy = entropy_attention(
         query, key, value,
         is_causal, scaling,
         temp
     )
+    # --- update temperature using last token entropy only ---
+    # attn_entropy: [Z, H, N_CTX]
+    entropy_last = attn_entropy[:, :, -1:].detach()  #if N_CTX = 32k, don’t update temperature 32k times, but only update state from the last position
 
-    # save the entropy for the next iteration
-    module.past_entropy = attn_entropy
+    # kv_len after cache update
+    kv_len = key.shape[2]
+
+    controller.update(entropy_last, kv_len)
+    # ------
+
+    # sanity check - temps should hover roughly in [0.75 – 1.05]
+    if N_CTX == 1:  # decoding only, avoid prefill spam  (N_CTX > 1 ⇒ prefill; N_CTX == 1 ⇒ decode)
+        layer_idx = getattr(module, "layer_idx", None)
+        print(
+            f"[layer {layer_idx}] "
+            f"ema_entropy={controller.ema_entropy.mean().item():.4f} "
+            f"temp={controller.temp.mean().item():.4f}"
+        )
+
+    # mark that entropy exists for this layer, save the entropy for the next iteration
+    module.past_entropy = entropy_last #attn_entropy
+    # record temp for logging
+    module.past_temp = controller.temp.detach().clone()
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, None

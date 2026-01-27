@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from models.entropy_attn_triton import attention
 
-def test_prefill(Z=1, H=8, N_CTX=512, HEAD_DIM=128, temp=None, dtype=torch.float16):
+def test_prefill(Z=1, H=8, N_CTX=512, HEAD_DIM=128, temp=None, dtype=torch.float16): # Z -> batch size
     device = "cuda:0"
 
     if temp is None:
