@@ -55,23 +55,22 @@ class EntropyTempController:
         if self.temp is None:
             self._init_state(entropy_last.shape, entropy_last.device)
 
-        # Normalize entropy to ~[0,1]
+        # Normalize entropy by kv length to ~[0,1]
         norm = torch.log(torch.tensor(float(kv_len), device=entropy_last.device))
         H_norm = entropy_last / norm.clamp(min=1.0)
 
-        # EMA smoothing
-        self.ema_entropy.mul_(self.ema_beta).add_(H_norm * (1 - self.ema_beta))
+        # EMA smoothing (0.9 old + 0.1 new)
+        self.ema_entropy.mul_(self.ema_beta).add_(H_norm * (1 - self.ema_beta)) 
 
         # Proportional control:
-        # higher entropy → reduce temp (sharpen attention)
         # delta = -self.kp * self.ema_entropy
-        H_star = 0.45
+        H_star = 0.45 # threshold
         # delta = -self.kp * (self.ema_entropy - H_star)
         error = self.ema_entropy - H_star
-        error = torch.where(error > 0, error, torch.zeros_like(error))
+        error = torch.where(error > 0, error, torch.zeros_like(error)) # only for higher entropy -> reduce temp (sharpen attention)
         delta = -self.kp * error
 
-        # Step limit
+        # Step limit for gradual temp update
         delta = delta.clamp(-self.max_step, self.max_step)
 
         self.temp.add_(delta)
