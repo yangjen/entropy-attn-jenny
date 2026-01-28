@@ -65,60 +65,65 @@ def entropy_attention_forward(
     Maintain a per-layer, per-head scalar temperature state (e.g., [Z, H, 1])
 
     """
-    if hasattr(module, "past_entropy"):
-        # entropy-conditioned temperature (controller already exists)
-        controller = module._entropy_temp_controller
-    else:
-        # first time this layer sees entropy → initialize controller
-        controller = EntropyTempController(
+    # ---------- entropy-conditioned temperature (single controller) ----------
+    if not hasattr(module, "_entropy_temp_controller"):
+        module._entropy_temp_controller = EntropyTempController(
             temp_init=1.0,
-            temp_min=0.6,
-            temp_max=1.2,
+            temp_min=0.7,
+            temp_max=1.0,
             ema_beta=0.9,
-            kp=0.4,
+            kp=0.35,
             max_step=0.05,
         )
-        module._entropy_temp_controller = controller
 
-    # ensure controller state is initialized
+    controller = module._entropy_temp_controller
+
+    # initialize controller state once
     if controller.temp is None:
-        controller._init_state(
-            (Z, H, 1),
-            query.device,
-        )
+        controller._init_state((Z, H, 1), query.device)
 
-    # expand temp to match attention shape
     temp = controller.temp.expand(Z, H, N_CTX)
 
-
+    # ---------- attention ----------
     attn_output, attn_entropy = entropy_attention(
         query, key, value,
         is_causal, scaling,
         temp
     )
-    # --- update temperature using last token entropy only ---
-    # attn_entropy: [Z, H, N_CTX]
-    entropy_last = attn_entropy[:, :, -1:].detach()  #if N_CTX = 32k, don’t update temperature 32k times, but only update state from the last position
 
-    # kv_len after cache update
-    kv_len = key.shape[2]
+    # ---------- prompt entropy reference (prefill only) ----------
+    if N_CTX > 1 and controller.prompt_target_entropy is None:
+        kv_len = key.shape[2]
 
-    controller.update(entropy_last, kv_len)
-    # ------
+        H_norm = attn_entropy / torch.log(
+            torch.tensor(float(kv_len), device=attn_entropy.device)
+        ).clamp(min=1.0)
 
-    # sanity check - temps should hover roughly in [0.75 – 1.05]
-    if N_CTX == 1:  # decoding only, avoid prefill spam  (N_CTX > 1 ⇒ prefill; N_CTX == 1 ⇒ decode)
-        layer_idx = getattr(module, "layer_idx", None)
+        K = min(256, H_norm.shape[-1])
+        tail = H_norm[:, :, -K:]              # [Z, H, K]
+
+        prompt_target = tail.mean(dim=-1, keepdim=True)
+        controller.set_prompt_target(prompt_target)
+
+    # ---------- decode-time entropy feedback ----------
+    if N_CTX == 1:
+        entropy_last = attn_entropy[:, :, -1:].detach()
+        kv_len = key.shape[2]
+
+        controller.update(entropy_last, kv_len)
+
+        module.past_entropy = entropy_last
+        module.past_temp = controller.temp.detach()
+
+    # ---- sanity check (temporary) ----
+    if N_CTX == 1 and controller.prompt_target_entropy is not None and torch.rand(1).item() < 0.01:
+        layer_idx = getattr(module, "layer_idx", "?")
         print(
             f"[layer {layer_idx}] "
-            f"ema_entropy={controller.ema_entropy.mean().item():.4f} "
-            f"temp={controller.temp.mean().item():.4f}"
+            f"H*={controller.prompt_target_entropy.mean().item():.3f} "
+            f"H={controller.ema_entropy.mean().item():.3f} "
+            f"T={controller.temp.mean().item():.3f}"
         )
-
-    # mark that entropy exists for this layer, save the entropy for the next iteration
-    module.past_entropy = entropy_last #attn_entropy
-    # record temp for logging
-    module.past_temp = controller.temp.detach().clone()
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, None

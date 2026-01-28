@@ -1,5 +1,5 @@
 '''
-CUDA_VISIBLE_DEVICES=0 python run_ruler_eval_timed.py \
+CUDA_VISIBLE_DEVICES=3 python run_ruler_eval_timed.py \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --data_root /c2/jenny/r3/RULER_outputs/llama3.1-8b-chat/synthetic/32768/data \
   --tasks qa_1 \
@@ -14,7 +14,7 @@ CUDA_VISIBLE_DEVICES=0 python run_ruler_eval_timed.py \
   --time_skip 4 \
   --pred_name predictions_timed_scaled.jsonl
 
-  CUDA_VISIBLE_DEVICES=5 python run_ruler_eval_timed.py \
+  CUDA_VISIBLE_DEVICES=0 python run_ruler_eval_timed.py \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --data_root /c2/jenny/r3/RULER_outputs/llama3.1-8b-chat/synthetic/32768/data \
   --tasks qa_2 \
