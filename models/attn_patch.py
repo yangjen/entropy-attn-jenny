@@ -72,7 +72,7 @@ def entropy_attention_forward(
             temp_min=0.7,
             temp_max=1.0,
             ema_beta=0.9,
-            kp=0.35,
+            kp=0.35, # proportional gain
             max_step=0.05,
         )
 
@@ -99,10 +99,12 @@ def entropy_attention_forward(
             torch.tensor(float(kv_len), device=attn_entropy.device)
         ).clamp(min=1.0)
 
+        # use tail of prompt (last K tokens)
         K = min(256, H_norm.shape[-1])
         tail = H_norm[:, :, -K:]              # [Z, H, K]
 
-        prompt_target = tail.mean(dim=-1, keepdim=True)
+        # use tail entropy mean as target
+        prompt_target = tail.mean(dim=-1, keepdim=True) 
         controller.set_prompt_target(prompt_target)
 
     # ---------- decode-time entropy feedback ----------
@@ -115,7 +117,7 @@ def entropy_attention_forward(
         module.past_entropy = entropy_last
         module.past_temp = controller.temp.detach()
 
-    # ---- sanity check (temporary) ----
+    # ---- sanity check (sampled) ----
     if N_CTX == 1 and controller.prompt_target_entropy is not None and torch.rand(1).item() < 0.01:
         layer_idx = getattr(module, "layer_idx", "?")
         print(

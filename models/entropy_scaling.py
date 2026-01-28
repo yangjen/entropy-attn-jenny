@@ -24,7 +24,7 @@ class EntropyTempController:
         self,
         temp_init=1.0,
         temp_min=0.7,
-        temp_max=1.3,
+        temp_max=1.0,
         ema_beta=0.9,
         kp=0.35,
         max_step=0.05,
