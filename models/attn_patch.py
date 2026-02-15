@@ -3,6 +3,10 @@ from typing import Optional
 from models.entropy_attn_triton import attention as entropy_attention
 from transformers.utils import logging
 from models.entropy_scaling import EntropyTempController
+from models.entropy_ops import (
+    normalize_entropy,
+    compute_target_from_tail,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -96,24 +100,17 @@ def entropy_attention_forward(
     if N_CTX > 1 and controller.prompt_target_entropy is None:
         kv_len = key.shape[2]
 
-        H_norm = attn_entropy / torch.log(
-            torch.tensor(float(kv_len), device=attn_entropy.device)
-        ).clamp(min=1.0)
+        # Normalize entropy for comparison across sequence lengths
+        H_norm = normalize_entropy(attn_entropy, kv_len)
 
-        # use tail of prompt (last K tokens)
-        K = min(256, H_norm.shape[-1])
-        tail = H_norm[:, :, -K:]              # [Z, H, K]
-
-        # use tail entropy trimmed-mean as target (trim low/high outliers)
+        # Extract target from prompt tail using trimmed mean
         trim_ratio = float(getattr(module, "target_trim_ratio", 0.0))
-        trim_ratio = max(0.0, min(0.49, trim_ratio))
-        trim_n = int(K * trim_ratio)
-        if trim_n > 0 and (2 * trim_n) < K:
-            tail_sorted = torch.sort(tail, dim=-1).values
-            tail_core = tail_sorted[:, :, trim_n:(K - trim_n)]
-            prompt_target = tail_core.mean(dim=-1, keepdim=True)
-        else:
-            prompt_target = tail.mean(dim=-1, keepdim=True)
+        prompt_target = compute_target_from_tail(
+            H_norm,
+            tail_length=256,
+            trim_ratio=trim_ratio
+        )
+
         controller.set_prompt_target(prompt_target)
 
     # ---------- decode-time entropy feedback ----------

@@ -1,6 +1,12 @@
 # models/entropy_scaling.py
 
 import torch
+from models.entropy_ops import (
+    normalize_entropy,
+    update_ema,
+    compute_temperature_delta,
+    update_temperature,
+)
 
 
 class EntropyTempController:
@@ -48,8 +54,10 @@ class EntropyTempController:
         self.ema_entropy = torch.zeros(shape, device=device)
 
     def set_prompt_target(self, target_entropy: torch.Tensor):
-        """
-        target_entropy: [Z, H, 1], normalized
+        """Set target entropy from prompt phase.
+
+        Args:
+            target_entropy: [Z, H, 1] - Normalized target entropy
         """
         self.prompt_target_entropy = target_entropy.detach()
 
@@ -57,9 +65,14 @@ class EntropyTempController:
 
     @torch.no_grad()
     def update(self, entropy_last: torch.Tensor, kv_len: int):
-        """
-        entropy_last: [Z, H, 1] (last query token)
-        kv_len: current KV cache length
+        """Update temperature based on entropy error.
+
+        Args:
+            entropy_last: [Z, H, 1] - Raw entropy from last query token
+            kv_len: Current KV cache length
+
+        Returns:
+            Updated temperature [Z, H, 1]
         """
         if self.temp is None:
             self._init_state(entropy_last.shape, entropy_last.device)
@@ -69,37 +82,60 @@ class EntropyTempController:
             self.temp.fill_(self.temp_init)
             return self.temp
 
-        # normalize entropy so prompt/decode are comparable
-        norm = torch.log(
-            torch.tensor(float(kv_len), device=entropy_last.device)
-        ).clamp(min=1.0)
-
-        H_norm = entropy_last / norm
+        # Normalize entropy so prompt/decode are comparable
+        H_norm = normalize_entropy(entropy_last, kv_len)
         valid_entropy = torch.isfinite(H_norm)
         H_safe = torch.where(valid_entropy, H_norm, torch.zeros_like(H_norm))
 
-        # EMA smoothing: update only finite lanes; keep previous value otherwise.
-        ema_new = self.ema_entropy * self.ema_beta + H_safe * (1 - self.ema_beta)
-        self.ema_entropy = torch.where(valid_entropy, ema_new, self.ema_entropy)
+        # EMA smoothing: update only finite lanes; keep previous value otherwise
+        self.ema_entropy = update_ema(
+            self.ema_entropy,
+            H_safe,
+            beta=self.ema_beta,
+            valid_mask=valid_entropy
+        )
 
-        # error signal
+        # Compute temperature delta based on error
         if self.prompt_target_entropy is not None:
+            # Proportional control toward target
             valid_target = torch.isfinite(self.prompt_target_entropy)
             valid = valid_entropy & valid_target
-            target = torch.where(valid_target, self.prompt_target_entropy, torch.zeros_like(self.prompt_target_entropy))
-            err = self.ema_entropy - target
-            err = torch.clamp(err, min=0.0)
-        else:
-            # fallback: pure sharpening when entropy is high
-            valid = valid_entropy
-            err = self.ema_entropy
 
-        # proportional control (operate in temp space)
-        delta = -self.kp * err
-        delta = delta.clamp(-self.max_step, self.max_step)
+            # Safe target (replace invalid with zeros)
+            target_safe = torch.where(
+                valid_target,
+                self.prompt_target_entropy,
+                torch.zeros_like(self.prompt_target_entropy)
+            )
+
+            delta = compute_temperature_delta(
+                self.ema_entropy,
+                target_safe,
+                kp=self.kp,
+                max_step=self.max_step,
+                allow_increase=False  # Only sharpen, never relax
+            )
+        else:
+            # Fallback: pure sharpening when entropy is high
+            # Treat current entropy as error (implicitly target=0)
+            valid = valid_entropy
+            delta = compute_temperature_delta(
+                self.ema_entropy,
+                torch.zeros_like(self.ema_entropy),
+                kp=self.kp,
+                max_step=self.max_step,
+                allow_increase=False
+            )
+
+        # Zero out delta for invalid positions
         delta = torch.where(valid, delta, torch.zeros_like(delta))
 
-        self.temp.add_(delta)
-        self.temp.clamp_(self.temp_min, self.temp_max)
+        # Update temperature
+        self.temp = update_temperature(
+            self.temp,
+            delta,
+            temp_min=self.temp_min,
+            temp_max=self.temp_max
+        )
 
         return self.temp

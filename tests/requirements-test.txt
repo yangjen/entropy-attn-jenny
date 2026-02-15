@@ -1,0 +1,6 @@
+# Minimal requirements for running entropy_ops tests
+# Install with: pip install -r requirements-test.txt
+
+torch>=2.0.0
+pytest>=7.0.0
+numpy>=1.20.0
