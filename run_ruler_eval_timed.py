@@ -17,7 +17,7 @@ CUDA_VISIBLE_DEVICES=3 python run_ruler_eval_timed.py \
 
   CUDA_VISIBLE_DEVICES=5 python run_ruler_eval_timed.py \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --data_root /c2/jenny/r3/RULER_outputs/llama3.1-8b-chat/synthetic/65536/data \
+  --data_root /c2/jenny/r3/RULER_outputs/llama3.1-8b-chat/synthetic/32768/data \
   --tasks qa_2 \
   --max_new_tokens 64 \
   --compact \
@@ -30,7 +30,9 @@ CUDA_VISIBLE_DEVICES=3 python run_ruler_eval_timed.py \
   --time_skip 4 \
   --max_step 0.0005 \
   --target_trim_ratio 0.10 \
-  --run_tag predictions_timed_scaled_debug_trim_10.jsonl
+  --run_tag predictions_timed_scaled_debug_controller_reset.jsonl
+
+#  --target_trim_ratio 0.10 \
 
 '''
 
@@ -292,6 +294,37 @@ def reset_entropy_logs(model):
         if hasattr(m, "_decode_step"):
             delattr(m, "_decode_step")
 
+def reset_entropy_controller(model):
+    """
+    Reset entropy-temp controller state between samples to avoid cross-sample leakage.
+    This resets temp/ema/prompt_target_entropy because they live inside the controller.
+    """
+    core = getattr(model, "model", None)
+    layers = getattr(core, "layers", None) if core is not None else None
+
+    # Fast path for Llama-style HF models
+    if layers is not None:
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is None:
+                continue
+            if hasattr(attn, "_entropy_temp_controller"):
+                delattr(attn, "_entropy_temp_controller")
+            # optional: clean debug attrs if you set them
+            if hasattr(attn, "past_entropy"):
+                delattr(attn, "past_entropy")
+            if hasattr(attn, "past_temp"):
+                delattr(attn, "past_temp")
+        return
+
+    # Fallback: scan modules (slower but safe)
+    for m in model.modules():
+        if hasattr(m, "_entropy_temp_controller"):
+            delattr(m, "_entropy_temp_controller")
+        if hasattr(m, "past_entropy"):
+            delattr(m, "past_entropy")
+        if hasattr(m, "past_temp"):
+            delattr(m, "past_temp")
 
 def collect_entropy_logs(model):
     mods = getattr(model, "_entropy_logger_modules", None)
@@ -449,6 +482,7 @@ def main():
 
                 if args.attn_impl == "entropy_attn":
                     reset_entropy_logs(runner.model)
+                    reset_entropy_controller(runner.model)
 
                 pred = _cuda_time_call(
                     lambda: runner.generate_one(

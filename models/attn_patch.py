@@ -93,7 +93,7 @@ def entropy_attention_forward(
     )
 
     # ---------- prompt entropy reference (prefill only) ----------
-    if N_CTX > 1:
+    if N_CTX > 1 and controller.prompt_target_entropy is None:
         kv_len = key.shape[2]
 
         H_norm = attn_entropy / torch.log(

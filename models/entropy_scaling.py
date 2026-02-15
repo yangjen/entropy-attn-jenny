@@ -88,6 +88,7 @@ class EntropyTempController:
             valid = valid_entropy & valid_target
             target = torch.where(valid_target, self.prompt_target_entropy, torch.zeros_like(self.prompt_target_entropy))
             err = self.ema_entropy - target
+            err = torch.clamp(err, min=0.0)
         else:
             # fallback: pure sharpening when entropy is high
             valid = valid_entropy
