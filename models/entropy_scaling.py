@@ -33,7 +33,7 @@ class EntropyTempController:
         temp_max=1.0,
         ema_beta=0.9,
         kp=0.35,
-        max_step=0.05,
+        max_step=0.0005,
     ):
         self.temp_min = temp_min
         self.temp_max = temp_max

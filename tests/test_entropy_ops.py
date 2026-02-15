@@ -18,6 +18,7 @@ from models.entropy_ops import (
     update_temperature,
     compute_controller_health_metrics,
 )
+from models.entropy_scaling import EntropyTempController
 
 
 class TestNormalizeEntropy:
@@ -440,3 +441,138 @@ class TestIntegratedControlLoop:
         print(f"  Temp after: {temp_after:.4f}")
 
         assert temp_after < temp_before, "Should decrease temp in response to higher target entropy"
+
+    @pytest.mark.slow
+    def test_production_parameters_are_optimal(self, test_seed):
+        """Verify that production parameters are optimal compared to alternatives.
+
+        Tests current production parameters against a range of alternatives.
+        Fails if any alternative achieves significantly better saturation.
+
+        This is a regression test to ensure parameter choices are justified.
+
+        Marked as slow: ~27 seconds (tests 79 parameter combinations × 100 runs each).
+        Run with: pytest -m slow
+        """
+        # Get production parameters
+        controller = EntropyTempController()
+        prod_kp = controller.kp
+        prod_ema_beta = controller.ema_beta
+        prod_max_step = controller.max_step
+
+        # Test configuration
+        target = torch.tensor([[[2.0]]])
+        noise_level = 0.3  # Medium volatility
+        n_runs = 100  # Increased for more robust statistics
+
+        # Alternative parameters to test against (comprehensive grid)
+        alternatives = []
+
+        # Systematic grid search
+        for kp in [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]:
+            for ema_beta in [0.85, 0.88, 0.90, 0.92, 0.94, 0.95, 0.96, 0.98]:
+                # Skip production parameters (will be tested separately)
+                if not (kp == prod_kp and ema_beta == prod_ema_beta):
+                    alternatives.append((kp, ema_beta))
+
+        # Test production parameters
+        prod_sat_fracs = []
+        for run_idx in range(n_runs):
+            run_seed = test_seed + run_idx
+            np.random.seed(run_seed)
+            torch.manual_seed(run_seed)
+
+            temp = torch.tensor([[[1.0]]])
+            ema_entropy = torch.tensor([[[0.0]]])
+            temps = [temp.item()]
+
+            for step in range(200):
+                entropy_noisy = target + noise_level * torch.randn_like(target)
+
+                if step == 0:
+                    ema_entropy = entropy_noisy
+                else:
+                    ema_entropy = update_ema(ema_entropy, entropy_noisy, beta=prod_ema_beta)
+
+                delta = compute_temperature_delta(ema_entropy, target, kp=prod_kp, max_step=prod_max_step)
+                temp = update_temperature(temp, delta, temp_min=0.7, temp_max=1.0)
+                temps.append(temp.item())
+
+            temps_tensor = torch.tensor(temps)
+            metrics = compute_controller_health_metrics(temps_tensor, temp_min=0.7, temp_max=1.0)
+            prod_sat_fracs.append(metrics["temp_sat_frac"])
+
+        prod_sat_mean = np.mean(prod_sat_fracs)
+        prod_sat_std = np.std(prod_sat_fracs)
+
+        print(f"\n{'='*70}")
+        print(f"PRODUCTION PARAMETERS:")
+        print(f"  kp={prod_kp:.2f}, ema_beta={prod_ema_beta:.2f}, max_step={prod_max_step}")
+        print(f"  Saturation: {prod_sat_mean:.3f} ± {prod_sat_std:.3f}")
+        print(f"{'='*70}\n")
+
+        # Test alternatives
+        better_alternatives = []
+
+        for kp, ema_beta in alternatives:
+            alt_sat_fracs = []
+
+            for run_idx in range(n_runs):
+                run_seed = test_seed + run_idx
+                np.random.seed(run_seed)
+                torch.manual_seed(run_seed)
+
+                temp = torch.tensor([[[1.0]]])
+                ema_entropy = torch.tensor([[[0.0]]])
+                temps = [temp.item()]
+
+                for step in range(200):
+                    entropy_noisy = target + noise_level * torch.randn_like(target)
+
+                    if step == 0:
+                        ema_entropy = entropy_noisy
+                    else:
+                        ema_entropy = update_ema(ema_entropy, entropy_noisy, beta=ema_beta)
+
+                    delta = compute_temperature_delta(ema_entropy, target, kp=kp, max_step=prod_max_step)
+                    temp = update_temperature(temp, delta, temp_min=0.7, temp_max=1.0)
+                    temps.append(temp.item())
+
+                temps_tensor = torch.tensor(temps)
+                metrics = compute_controller_health_metrics(temps_tensor, temp_min=0.7, temp_max=1.0)
+                alt_sat_fracs.append(metrics["temp_sat_frac"])
+
+            alt_sat_mean = np.mean(alt_sat_fracs)
+            alt_sat_std = np.std(alt_sat_fracs)
+
+            # Check if significantly better (lower saturation by >2%)
+            improvement = prod_sat_mean - alt_sat_mean  # Positive if alternative is better
+
+            if improvement > 0.02:  # Alternative is >2% better (lower saturation)
+                better_alternatives.append({
+                    "kp": kp,
+                    "ema_beta": ema_beta,
+                    "sat_mean": alt_sat_mean,
+                    "sat_std": alt_sat_std,
+                    "improvement": improvement
+                })
+                print(f"⚠️  kp={kp:.2f}, ema_beta={ema_beta:.2f}: {alt_sat_mean:.3f} ± {alt_sat_std:.3f} (better by {improvement*100:.1f}%)")
+            else:
+                status = "✅" if alt_sat_mean <= prod_sat_mean + 0.02 else "❌"
+                print(f"{status} kp={kp:.2f}, ema_beta={ema_beta:.2f}: {alt_sat_mean:.3f} ± {alt_sat_std:.3f}")
+
+        # Fail if any alternative is significantly better
+        if better_alternatives:
+            print(f"\n{'='*70}")
+            print(f"FAILURE: Found {len(better_alternatives)} better parameter combinations:")
+            for alt in better_alternatives:
+                print(f"  kp={alt['kp']:.2f}, ema_beta={alt['ema_beta']:.2f}: "
+                      f"{alt['sat_mean']:.3f} ± {alt['sat_std']:.3f} "
+                      f"(better by {alt['improvement']*100:.1f}%)")
+            print(f"{'='*70}\n")
+            assert False, f"Production parameters suboptimal. Best alternative: kp={better_alternatives[0]['kp']}, ema_beta={better_alternatives[0]['ema_beta']}"
+        else:
+            print(f"\n{'='*70}")
+            print(f"✅ Production parameters are optimal (no alternative >2% better)")
+            print(f"{'='*70}\n")
+

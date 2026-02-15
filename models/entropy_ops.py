@@ -233,8 +233,8 @@ def compute_temperature_delta(
 def update_temperature(
     temp_current: Tensor,
     delta: Tensor,
-    temp_min: float = 0.7,
-    temp_max: float = 1.0
+    temp_min: float,
+    temp_max: float
 ) -> Tensor:
     """Update temperature with delta and clamp to valid range.
 

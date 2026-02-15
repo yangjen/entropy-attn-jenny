@@ -71,14 +71,12 @@ def entropy_attention_forward(
     """
     # ---------- entropy-conditioned temperature (single controller) ----------
     if not hasattr(module, "_entropy_temp_controller"):
-        max_step = getattr(module, "temp_max_step", 0.0005)
         module._entropy_temp_controller = EntropyTempController(
             temp_init=1.0,
             temp_min=0.7,
             temp_max=1.0,
             ema_beta=0.9,
-            kp=0.35, # proportional gain
-            max_step=max_step,
+            kp=0.35,  # proportional gain
         )
 
     controller = module._entropy_temp_controller
