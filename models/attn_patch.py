@@ -93,7 +93,7 @@ def entropy_attention_forward(
     )
 
     # ---------- prompt entropy reference (prefill only) ----------
-    if N_CTX > 1 and controller.prompt_target_entropy is None:
+    if N_CTX > 1:
         kv_len = key.shape[2]
 
         H_norm = attn_entropy / torch.log(
@@ -104,8 +104,16 @@ def entropy_attention_forward(
         K = min(256, H_norm.shape[-1])
         tail = H_norm[:, :, -K:]              # [Z, H, K]
 
-        # use tail entropy mean as target
-        prompt_target = tail.mean(dim=-1, keepdim=True) 
+        # use tail entropy trimmed-mean as target (trim low/high outliers)
+        trim_ratio = float(getattr(module, "target_trim_ratio", 0.0))
+        trim_ratio = max(0.0, min(0.49, trim_ratio))
+        trim_n = int(K * trim_ratio)
+        if trim_n > 0 and (2 * trim_n) < K:
+            tail_sorted = torch.sort(tail, dim=-1).values
+            tail_core = tail_sorted[:, :, trim_n:(K - trim_n)]
+            prompt_target = tail_core.mean(dim=-1, keepdim=True)
+        else:
+            prompt_target = tail.mean(dim=-1, keepdim=True)
         controller.set_prompt_target(prompt_target)
 
     # ---------- decode-time entropy feedback ----------

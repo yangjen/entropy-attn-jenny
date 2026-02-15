@@ -15,9 +15,9 @@ CUDA_VISIBLE_DEVICES=3 python run_ruler_eval_timed.py \
   --max_step 0.0005 \
   --run_tag predictions_timed_scaled.jsonl
 
-  CUDA_VISIBLE_DEVICES=6 python run_ruler_eval_timed.py \
+  CUDA_VISIBLE_DEVICES=5 python run_ruler_eval_timed.py \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --data_root /c2/jenny/r3/RULER_outputs/llama3.1-8b-chat/synthetic/32768/data \
+  --data_root /c2/jenny/r3/RULER_outputs/llama3.1-8b-chat/synthetic/65536/data \
   --tasks qa_2 \
   --max_new_tokens 64 \
   --compact \
@@ -29,8 +29,8 @@ CUDA_VISIBLE_DEVICES=3 python run_ruler_eval_timed.py \
   --time \
   --time_skip 4 \
   --max_step 0.0005 \
-  --run_tag predictions_timed_scaled_debug_finite_mask_strict.jsonl
-
+  --target_trim_ratio 0.10 \
+  --run_tag predictions_timed_scaled_debug_trim_10.jsonl
 
 '''
 
@@ -323,6 +323,22 @@ def set_temp_max_step(model, max_step: Optional[float]):
                 delattr(m, "_entropy_temp_controller")
 
 
+def set_target_trim_ratio(model, trim_ratio: Optional[float]):
+    if trim_ratio is None:
+        return
+    core = getattr(model, "model", None)
+    layers = getattr(core, "layers", None) if core is not None else None
+    if layers is not None:
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None:
+                setattr(attn, "target_trim_ratio", float(trim_ratio))
+        return
+    for m in model.modules():
+        if hasattr(m, "num_key_value_groups"):
+            setattr(m, "target_trim_ratio", float(trim_ratio))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -334,6 +350,12 @@ def main():
     # ap.add_argument("--entropy_log", action="store_true", help="Dump per-example entropy/temp logs (decode only).")
     # ap.add_argument("--entropy_log_name", default="entropy_logs.jsonl")
     ap.add_argument("--max_step", type=float, default=None, help="Override entropy controller max_step.")
+    ap.add_argument(
+        "--target_trim_ratio",
+        type=float,
+        default=0.0,
+        help="Trim ratio for prompt-tail target (e.g. 0.05 trims 5%% low/high).",
+    )
     ap.add_argument("--compact", action="store_true")
     ap.add_argument("--status_every", type=int, default=10)
 
@@ -377,6 +399,7 @@ def main():
         if model_obj is not None:
             mark_last_layer_entropy_logger(model_obj)
             set_temp_max_step(model_obj, args.max_step)
+            set_target_trim_ratio(model_obj, args.target_trim_ratio)
 
     all_tasks = sorted(
         [d for d in os.listdir(args.data_root) if os.path.isdir(os.path.join(args.data_root, d))]

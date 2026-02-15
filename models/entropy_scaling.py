@@ -64,6 +64,11 @@ class EntropyTempController:
         if self.temp is None:
             self._init_state(entropy_last.shape, entropy_last.device)
 
+        # Safe hard-disable: keep temperature fixed at init when scaling is disabled.
+        if self.max_step <= 0:
+            self.temp.fill_(self.temp_init)
+            return self.temp
+
         # normalize entropy so prompt/decode are comparable
         norm = torch.log(
             torch.tensor(float(kv_len), device=entropy_last.device)
