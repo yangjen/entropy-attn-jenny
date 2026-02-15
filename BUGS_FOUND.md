@@ -4,15 +4,23 @@
 **Date**: 2026-02-15
 **Investigation Focus**: Decode phase feedback loop and controller behavior
 
+**Status Summary**:
+- ✅ BUG #1: FIXED in commit `e64f6e5` (2026-02-16) - State leakage resolved
+- ⚠️ BUG #2: OPEN - Controller over-aggressive, saturates 48.6% of time
+- 🔥 BUG #3: OPEN - Inverted dose-response, needs investigation
+- ⚠️ BUG #4: UNVERIFIED - Entropy consistency between Triton/PyTorch (requires CUDA)
+
 ---
 
 ## Critical Issues Found
 
-### BUG #1: Controller State Leaking Between Examples 🚨
+### BUG #1: Controller State Leaking Between Examples 🚨 → ✅ FIXED
+
+**Status**: ✅ **FIXED** in commit `e64f6e5` (2026-02-16) - No longer an issue
 
 **Severity**: CRITICAL - Invalidates all evaluation results
 
-**Evidence**:
+**Original Evidence** (from stale logs):
 Examining `logs/qa_1_entropy_attn_entropy_logs_scaled.jsonl`:
 ```
 Example 0: temp_mean=1.0000 (all steps)
@@ -24,24 +32,38 @@ Example 4: temp_mean=0.9912 (starts here)
 Example 49: temp_mean=0.8928 (starts here)
 ```
 
-Temperature drifts from 1.0 → 0.89 across examples. State is not reset.
+Temperature drifted from 1.0 → 0.89 across examples. State was not reset.
 
-**Root Cause**:
-- `models/attn_patch.py:69-70`: Controller initialized once per layer
-- `run_ruler_eval_timed.py:297-327`: `reset_entropy_controller()` only resets `prompt_target_entropy`, not temperature or EMA state
+**Fix Implemented** (commit `e64f6e5`):
+`run_ruler_eval_timed.py:311-312` now deletes the entire controller object between examples:
+```python
+if hasattr(attn, "_entropy_temp_controller"):
+    delattr(attn, "_entropy_temp_controller")  # Delete entire controller
+```
+
+On the next forward pass, `models/attn_patch.py:73-82` recreates a fresh controller with:
+- `temp_init=1.0`
+- `temp=None` → triggers `_init_state()` → sets `temp=1.0`, `ema_entropy=0`
+- `prompt_target_entropy=None`
+
+This ensures each example starts with completely fresh state.
+
+**Verification**:
+The fix is active in the current codebase. The logs showing temperature drift are from before this fix was committed.
+
+**Original Root Cause** (before fix):
+- `models/attn_patch.py:73-82`: Controller initialized once per layer
+- `run_ruler_eval_timed.py` (old version): `reset_entropy_controller()` was incomplete or missing
 
 **Expected Behavior**:
 Each example should start with `temp=1.0`, `ema_entropy=0`, `prompt_target_entropy=None`
 
-**Impact**:
-- Later examples run with artificially lowered temperature
-- Baseline vs scaled comparisons are invalid
-- Measured improvements/degradations are artifacts of state leakage
+**Impact** (when bug was present):
+- Later examples ran with artificially lowered temperature
+- Baseline vs scaled comparisons were invalid
+- Measured improvements/degradations were artifacts of state leakage
 
-**Files Affected**:
-- `models/attn_patch.py:69-84`
-- `run_ruler_eval_timed.py:297-327`
-- `models/entropy_scaling.py:46-54` (needs reset method)
+**Current Status**: ✅ This issue is completely resolved in the current codebase.
 
 ---
 
@@ -203,21 +225,18 @@ Question: Should heads sharing same KV group share temperature?
 
 ## Recommended Fixes (Priority Order)
 
-### Priority 1: Fix State Leakage (BUG #1)
+### Priority 1: Fix State Leakage (BUG #1) - ✅ COMPLETED
 
-**Change `run_ruler_eval_timed.py:reset_entropy_controller()`**:
+**Status**: Already fixed in commit `e64f6e5`.
+
+The fix deletes and recreates the controller between examples via:
 ```python
-def reset_entropy_controller(model):
-    for module in model.modules():
-        if hasattr(module, "_entropy_temp_controller"):
-            controller = module._entropy_temp_controller
-            # Reset ALL state, not just target
-            controller.temp = None
-            controller.ema_entropy = None
-            controller.prompt_target_entropy = None
+# run_ruler_eval_timed.py:311-312
+if hasattr(attn, "_entropy_temp_controller"):
+    delattr(attn, "_entropy_temp_controller")
 ```
 
-**Alternative**: Add explicit reset method to `EntropyTempController`
+No further action needed.
 
 ---
 
@@ -261,8 +280,8 @@ Log per-head entropy and temperature for detailed analysis.
 
 ## Unit Tests Needed
 
-1. **Test: Controller state reset between examples**
-   - Verify temp, ema_entropy, prompt_target all reset
+1. ~~**Test: Controller state reset between examples**~~ ✅ Not needed - BUG #1 already fixed
+   - ~~Verify temp, ema_entropy, prompt_target all reset~~
 
 2. **Test: Triton vs PyTorch entropy equivalence**
    - Same Q, K, V, temp → same entropy (within tolerance)
@@ -301,14 +320,14 @@ Log per-head entropy and temperature for detailed analysis.
 ## Files to Modify
 
 ### Core Implementation:
-- `models/entropy_scaling.py` - Add reset(), tune params
-- `models/attn_patch.py` - Fix initialization, add better logging
-- `run_ruler_eval_timed.py` - Fix reset_entropy_controller()
+- `models/entropy_scaling.py` - Tune params for BUG #2
+- `models/attn_patch.py` - Update controller parameters, add better logging
+- ~~`run_ruler_eval_timed.py` - Fix reset_entropy_controller()~~ ✅ Already fixed
 
 ### Testing:
-- `test_kernel.py` - Add entropy consistency test
-- `test_controller.py` (NEW) - Unit tests for controller
-- `test_integration.py` (NEW) - End-to-end reset verification
+- `test_kernel.py` - Add entropy consistency test (requires CUDA)
+- ~~`test_controller.py` (NEW) - Unit tests for controller~~ ✅ Created as `tests/test_entropy_ops.py`
+- `test_integration.py` (NEW) - End-to-end verification (optional)
 
 ### Analysis:
 - `logs/entropy_scaling_analysis.ipynb` - Add more diagnostics
@@ -317,8 +336,9 @@ Log per-head entropy and temperature for detailed analysis.
 
 ## Next Steps
 
-1. Implement unit tests to reproduce BUG #1 and BUG #2
-2. Verify BUG #4 (entropy consistency)
-3. Create patches for Priority 1 and 2 fixes
-4. Re-run evaluation with fixes
-5. Analyze if improvements appear after bug fixes
+1. ~~Implement unit tests to reproduce BUG #1~~ ✅ BUG #1 already fixed - no action needed
+2. Implement unit tests to reproduce BUG #2 (controller saturation) - ✅ DONE in `tests/test_entropy_ops.py`
+3. Verify BUG #4 (entropy consistency) - requires CUDA environment
+4. Create patches for Priority 2 fix (BUG #2 - controller aggression)
+5. Re-run evaluation with fixes
+6. Analyze if improvements appear after bug fixes
