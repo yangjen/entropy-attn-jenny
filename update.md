@@ -109,7 +109,7 @@ We treat **RULER as test**, evaluated under the sessionized streaming protocol d
 - Keep it constant during evaluation (disable online updates)
 - Purpose: separates “better constant operating point” from “benefit of online adaptation”
 
-### S3: No-EMA ablation (secondary)
+### S2: No-EMA ablation (secondary)
 - Remove EMA smoothing (use instantaneous `H_norm` each step)
 - Keep the same update rule and bounds
 - Purpose: tests whether stateful smoothing/memory is necessary for streaming gains
@@ -139,6 +139,6 @@ We treat **RULER as test**, evaluated under the sessionized streaming protocol d
 ## Next Steps
 1. Implement sessionization (`K`, `W`) + multiple random orderings in the RULER runner.
 2. Add InfiniBench tuning sweep for `T0` and `T*` (log coverage/saturation/stability).
-3. Run the baseline/ablation set: Stateless, S1 (fixed tuned), Full streaming controller, S3 (no EMA).
+3. Run the baseline/ablation set: Stateless, S1 (fixed tuned), Full streaming controller, S2 (no EMA).
 4. Prepare plots: warm-up curve, temperature trajectory, ordering-robust mature-phase performance.
 5. (After RULER streaming is stable) extend to an agentic benchmark (e.g., WebArena) where sessions are natural (one trajectory = one session) and the main metric is task success rate.
