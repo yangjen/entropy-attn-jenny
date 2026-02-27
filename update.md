@@ -1,96 +1,146 @@
 # Project Direction Update: Streaming Inference-Time Adaptive Decoding (Entropy → Attention-Temperature Control)
 
-## Summary
-We reposition the project as **streaming / session-level inference-time adaptation**: the controller maintains state across consecutive requests (no per-sample reset) and converges to a stable operating regime (“plateau”). This better matches the intended deployment target (multi-turn / agentic workflows) than i.i.d. per-item evaluation.
+## TL;DR
+We reposition the project as **streaming / session-level inference-time adaptation**: the controller **does not reset per sample** inside a session and instead carries state across consecutive requests. We **calibrate the starting temperature** on **InfiniBench (validation)** and evaluate on **RULER (test)** using a **sessionized protocol** with warm-up vs mature-phase reporting and multiple random orderings.
+
+---
+
+## Motivation
+- We previously observed consistent gains when controller state persisted across samples (no reset), across multiple context lengths.
+- With strict per-sample reset (i.i.d. protocol), gains on RULER largely disappeared.
+- Synthetic tests/bug analysis indicate: the controller can converge when the target is reachable for a given attention regime, but a single global entropy target can be incompatible across diverse token-level attention regimes. Streaming adaptation may still help by converging to a better operating point for the stream distribution.
 
 ---
 
 ## Current Approach
 
-### What is controlled
-We intervene by applying **temperature-like scaling to attention logits (Q·K scores)** during decoding.
+### What we control (attention-side temperature)
+We intervene by applying **temperature-like scaling inside attention softmax** (Q·K → softmax):
 
-Conceptually:
-- Attention weights are computed as:
-  \[
-  \text{attn}(q,k) = \text{softmax}\left(\frac{qk^\top}{T}\right)
-  \]
-- When the risk signal (e.g., attention entropy) indicates uncertainty, we reduce `T` (sharpen attention). Otherwise, we relax toward `T ≈ 1.0`.
-- `T` is bounded to avoid extreme behavior:
-  - `T ∈ [T_min, 1.0]` (and we track saturation at bounds).
+\[
+\text{attn}(q,k) = \text{softmax}\left(\frac{qk^\top}{T}\right)
+\]
 
-### Controller state (what it remembers)
-The controller is a stateful online control loop that persists across items within a session. It remembers:
-- Current temperature `T`
-- Running statistics of the risk signal (e.g., **EMA** of entropy / uncertainty)
-- Step/update budget info (e.g., max update size / max adjustments)
-- Optional health stats: saturation counts, intervention counts
+- Smaller \(T\) → sharper (more peaked) attention
+- Larger \(T\) → flatter attention
+- We bound temperature to a safe range: \(T \in [T_{\min}, 1.0]\)
 
-Because we **do not reset per sample**, these states carry from item `i` → `i+1`, enabling session-level adaptation.
+### Controller state (what it remembers across items)
+The controller is a stateful online control loop attached to attention modules. Within a session, it persists across samples and remembers:
+- Current attention temperature `T` (per head)
+- EMA of normalized attention entropy (per head)
+- Optional prompt-derived target entropy (per head) from the prefill stage
+- Health/limits: update step budget, clamping/saturation behavior
 
 ---
 
-## Why this direction
-- We previously observed consistent gains when controller state persisted across items.
-- With strict per-sample reset (i.i.d. protocol), gains on RULER largely disappeared.
-- Bug analysis suggests a key limitation: **temperature has limited control authority within a fixed attention pattern**, while real decoding exhibits **multiple attention regimes** (peaked/copy, recency, uniform-like, etc.). A single global target can be unreachable for many regimes, leading to saturation.  
-Streaming adaptation may still help by converging to a better operating point for the workload distribution, even if per-token setpoint control is imperfect.
+## Scaling / Update Logic (current implementation)
+
+### Signals
+At each decode step, we read the attention entropy for the last token and normalize it by context length:
+- `kv_len` = current KV cache length
+- `norm = log(kv_len)` (clamped to >= 1)
+- `H_norm = H_last / norm`
+
+We maintain EMA smoothing per head:
+- `EMA <- beta * EMA + (1 - beta) * H_norm`
+
+### Targeting and error signal (one-sided)
+If a target entropy exists (estimated during prefill), we compute a one-sided error:
+- `err = max(EMA - target, 0)`
+
+If no target exists:
+- `err = EMA` (still nonnegative)
+
+**Implication:** the controller primarily **sharpens** when entropy is above target; it does not actively “relax” when entropy is below target.
+
+### Temperature update (bounded proportional control)
+We update temperature with bounded steps:
+- `delta = clip(-kp * err, [-max_step, +max_step])`
+- `T <- clip(T + delta, [T_min, 1.0])`
 
 ---
 
-## Calibration (model-specific starting point)
-To avoid test leakage while keeping streaming adaptation:
-- Tune a model-specific initial operating point on a **separate long-context validation dataset** (e.g., InfiniBench):
-  - initial temperature `T0` **or**
-  - entropy anchor `H*` (if the controller uses an entropy reference)
-- Then evaluate on **RULER as test**, running in streaming mode (no per-sample reset).
+## Streaming / Session Protocol
 
----
-
-## Evaluation Plan (RULER as a streaming proxy)
-
-### Sessionized protocol
-RULER is normally i.i.d., so we define a streaming protocol:
-- Split the evaluation set into **sessions** of length `K`.
-- Reset controller **between sessions only**.
+### Why sessionization is needed
+RULER is normally evaluated i.i.d. (each example independent). Because our method carries state across samples, we must define a streaming protocol:
+- **Reset between sessions**, not between samples.
 - Within a session, controller state persists across items.
 
 ### Warm-up vs mature phase
 We expect adaptation to plateau:
-- Define warm-up length `W`.
+- Session length: `K`
+- Warm-up length: `W`
 - Report:
-  - **Warm-up performance**: items `1..W`
-  - **Mature performance**: items `W+1..K` (primary streaming number)
+  - Warm-up performance: items `1..W`
+  - **Mature-phase performance**: items `W+1..K` (primary streaming metric)
 
 ### Order dependence
-Because streaming systems can be order-sensitive:
+Because online adaptation can depend on ordering:
 - Run multiple random orderings (e.g., 5–10 shuffles).
-- Report mean ± std for mature-phase accuracy.
+- Report mean ± std across orderings (and optionally min/max).
 
-### Metrics to report
-- Primary: **accuracy/task score** (per task, per context length bucket)
-- Streaming-specific:
-  - warm-up curve (accuracy vs position in session)
-  - temperature trajectory (plateau evidence)
-- Controller health:
-  - intervention coverage
-  - saturation rate (`T` at `T_min` or `1.0`)
-  - stability/oscillation indicators
+---
 
-### Baselines
-- Stateless baseline: fixed decoding / fixed `T=1.0`
-- (Recommended) Simple streaming baseline: naive EMA-based global temperature update  
-  to show gains are not merely from “having state.”
+## Calibration Plan (InfiniBench → RULER)
+
+### Validation (InfiniBench)
+We use **InfiniBench** as validation to tune:
+- Initial temperature `T0` (starting operating point), and/or
+- A fixed constant temperature `T*` (for baseline S1)
+
+Tuning targets:
+- stable behavior (avoid frequent saturation)
+- reasonable intervention coverage
+- (optionally) validation accuracy as a secondary signal
+
+### Test (RULER)
+We treat **RULER as test**, evaluated under the sessionized streaming protocol described above.
+
+---
+
+## Baselines / Ablations (committed)
+
+### Baseline 0: Stateless (standard)
+- No controller / no streaming adaptation
+- Equivalent to fixed attention temperature `T=1.0`
+
+### S1: Calibrated constant attention temperature (must-have)
+- Tune a fixed `T*` on InfiniBench
+- Keep it constant during evaluation (disable online updates)
+- Purpose: separates “better constant operating point” from “benefit of online adaptation”
+
+### S3: No-EMA ablation (secondary)
+- Remove EMA smoothing (use instantaneous `H_norm` each step)
+- Keep the same update rule and bounds
+- Purpose: tests whether stateful smoothing/memory is necessary for streaming gains
+
+---
+
+## Metrics to Report
+
+### Primary (RULER)
+- Accuracy / task score
+- Reported by:
+  - task (e.g., qa_1, qa_2)
+  - context length bucket
+  - session position summary: warm-up vs mature phase
+
+### Streaming-specific
+- Warm-up curve: accuracy vs position in session
+- Robustness: mean ± std across orderings
+
+### Controller health / mechanism
+- Intervention coverage (% decode steps where `err > 0` / temp update applied)
+- Saturation rate (% time `T` hits bounds)
+- Temperature trajectory over session (plateau evidence)
 
 ---
 
 ## Next Steps
-1. Implement sessionization (`K`, `W`) + multiple orderings; log warm-up curves and mature-phase metrics.
-2. Run validation tuning for `T0` or `H*` (track coverage/saturation to avoid degenerate settings).
-3. Ablations:
-   - tuned start + streaming updates (full)
-   - tuned start + no updates (fixed)
-   - untuned start + streaming updates
-4. Extend to agentic benchmark (e.g., WebArena):
-   - session = one trajectory
-   - metrics: task success rate, invalid action rate, retries/backtracking, groundedness vs visited evidence.
+1. Implement sessionization (`K`, `W`) + multiple random orderings in the RULER runner.
+2. Add InfiniBench tuning sweep for `T0` and `T*` (log coverage/saturation/stability).
+3. Run the baseline/ablation set: Stateless, S1 (fixed tuned), Full streaming controller, S3 (no EMA).
+4. Prepare plots: warm-up curve, temperature trajectory, ordering-robust mature-phase performance.
+5. (After RULER streaming is stable) extend to an agentic benchmark (e.g., WebArena) where sessions are natural (one trajectory = one session) and the main metric is task success rate.
