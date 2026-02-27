@@ -17,11 +17,11 @@ We reposition the project as **streaming / session-level inference-time adaptati
 ### What we control (attention-side temperature)
 We intervene by applying **temperature-like scaling inside attention softmax** (Q·K → softmax):
 
-attn(q, k) = softmax((q k^T) / T)
+`attn(q, k) = softmax((q k^T) / T)`
 
 - Smaller \(T\) → sharper (more peaked) attention
 - Larger \(T\) → flatter attention
-- We bound temperature: T in [T_min, 1.0].
+- We bound temperature: T in `[T_min, 1.0]`.
 
 ### Controller state (what it remembers across items)
 The controller is a stateful online control loop attached to attention modules. Within a session, it persists across samples and remembers:
