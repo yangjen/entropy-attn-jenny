@@ -1,7 +1,7 @@
 # Project Direction Update: Streaming Inference-Time Adaptive Decoding (Entropy → Attention-Temperature Control)
 
 ## TL;DR
-We reposition the project as **streaming / session-level inference-time adaptation**: the controller **does not reset per sample** inside a session and instead carries state across consecutive requests. We **calibrate the starting temperature** on **InfiniBench (validation)** and evaluate on **RULER (test)** using a **sessionized protocol** with warm-up vs mature-phase reporting and multiple random orderings.
+We reposition the project as **streaming / session-level inference-time adaptation**: the controller **does not reset per sample** inside a session and instead carries state across consecutive requests. We will **calibrate the starting temperature** on **InfiniBench (validation)** and evaluate on **RULER (test)** using a **sessionized protocol** with warm-up vs mature-phase reporting and multiple random orderings.
 
 ---
 
